@@ -9,10 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, shouldIncludeFile } from '../src/extraction';
+import { extractFromSource, scanDirectory } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
-import { DEFAULT_CONFIG } from '../src/types';
 
 beforeAll(async () => {
   await initGrammars();
@@ -92,6 +91,14 @@ describe('Language Detection', () => {
 
   it('should detect Dart files', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
+  });
+
+  it('should detect Objective-C files', () => {
+    expect(detectLanguage('AppDelegate.m')).toBe('objc');
+    expect(detectLanguage('ViewController.mm')).toBe('objc');
+    const objcHeader = '@interface Foo : NSObject\n@end\n';
+    expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
   it('should return unknown for unsupported extensions', () => {
@@ -196,6 +203,38 @@ export interface User {
       name: 'User',
       isExported: true,
     });
+  });
+
+  it('should extract type references from interface property signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface Hprops {
+  value?: Partial<IPage> & Partial<IOrderField>;
+}
+`;
+    const result = extractFromSource('HeaderFilter.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
+  it('should extract type references from interface method signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface MethodForm {
+  fetchPage(arg: IPage): IOrderField;
+}
+`;
+    const result = extractFromSource('MethodForm.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
   it('should track function calls', () => {
@@ -479,6 +518,20 @@ export const authMachine = createMachine({
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
+
+  it('should extract calls from a top-level variable initializer (issue #425)', () => {
+    const code = `
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+`;
+    const result = extractFromSource('app.ts', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -760,6 +813,130 @@ public class Calculator {
     const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
     expect(methodNode).toBeDefined();
     expect(methodNode?.isStatic).toBe(true);
+  });
+
+  it('wraps top-level declarations in a namespace from package_declaration', () => {
+    const code = `
+package com.example.foo;
+
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  it('extracts anonymous-class overrides from `new T() { ... }`', () => {
+    // The pattern that breaks the trace through `strategy.foo()` in
+    // libraries like guava's Splitter: the lambda-returned anonymous
+    // class overrides abstract methods on the base, but without
+    // extracting those overrides the interface→impl synthesizer has
+    // nothing to bridge.
+    const code = `
+package com.example;
+
+abstract class Base {
+  abstract int compute(int x);
+}
+
+public class Factory {
+  public Base make() {
+    return new Base() {
+      @Override
+      int compute(int x) { return x + 1; }
+    };
+  }
+}
+`;
+    const result = extractFromSource('Factory.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /Base\$anon@/.test(n.name));
+    expect(anon, 'anonymous Base subclass should be extracted as a class').toBeDefined();
+
+    const compute = result.nodes.find(
+      (n) => n.kind === 'method' && n.name === 'compute' && n.qualifiedName.includes('$anon@')
+    );
+    expect(compute, 'override method should be a method on the anon class').toBeDefined();
+    expect(compute!.qualifiedName).toContain('Factory::make::<Base$anon@');
+    expect(compute!.qualifiedName.endsWith('::compute')).toBe(true);
+
+    // Anon class must extend Base so Phase 5.5 (interface-impl) can bridge.
+    const extendsRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'extends' && r.referenceName === 'Base' && r.fromNodeId === anon!.id
+    );
+    expect(extendsRef, 'anon class should carry an `extends Base` reference').toBeDefined();
+
+    // The enclosing `make` method still emits an instantiates edge to Base —
+    // anon extraction must not swallow that signal.
+    const instantiatesRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Base'
+    );
+    expect(instantiatesRef, 'enclosing method should still instantiate Base').toBeDefined();
+  });
+
+  it('extracts anonymous-class overrides inside a lambda body', () => {
+    // The exact guava pattern: a lambda is passed to a constructor, and the
+    // lambda body returns `new T() { @Override ... }`. The anon class must
+    // still surface even though it sits inside a lambda_expression node.
+    const code = `
+package com.example;
+
+interface Strategy {
+  java.util.Iterator<String> iterator(String s);
+}
+
+abstract class BaseIter implements java.util.Iterator<String> {
+  abstract int separatorStart(int start);
+}
+
+public class Splitter {
+  private final Strategy strategy;
+  public Splitter(Strategy s) { this.strategy = s; }
+
+  public static Splitter on(char c) {
+    return new Splitter((seq) ->
+        new BaseIter() {
+          @Override
+          int separatorStart(int start) { return start + 1; }
+          @Override public boolean hasNext() { return false; }
+          @Override public String next() { return null; }
+        });
+  }
+}
+`;
+    const result = extractFromSource('Splitter.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /BaseIter\$anon@/.test(n.name));
+    expect(anon, 'anon BaseIter inside the lambda body should be extracted').toBeDefined();
+
+    const sepStart = result.nodes.find(
+      (n) =>
+        n.kind === 'method' &&
+        n.name === 'separatorStart' &&
+        n.qualifiedName.includes('$anon@')
+    );
+    expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
   });
 });
 
@@ -1120,6 +1297,54 @@ interface WebSocket {
     expect(methodNames).toContain('send');
     expect(methodNames).toContain('cancel');
   });
+
+  it('wraps top-level declarations in a namespace from package_header', () => {
+    const code = `
+package com.example.foo
+
+class Bar {
+  fun greet(): String = "hi"
+}
+
+fun util(): Int = 42
+`;
+    const result = extractFromSource('Bar.kt', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+
+    const util = result.nodes.find((n) => n.kind === 'function' && n.name === 'util');
+    expect(util?.qualifiedName).toBe('com.example.foo::util');
+  });
+
+  it('handles a single-segment package', () => {
+    const code = `
+package foo
+
+class Bar
+`;
+    const result = extractFromSource('Bar.kt', code);
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('foo::Bar');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+class Bar {
+  fun greet() = "hi"
+}
+`;
+    const result = extractFromSource('Bar.kt', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
 });
 
 describe('Dart Extraction', () => {
@@ -1152,6 +1377,11 @@ class UserService {
     const privateMethod = methodNodes.find((m) => m.name === '_privateMethod');
     expect(privateMethod).toBeDefined();
     expect(privateMethod?.visibility).toBe('private');
+
+    // Dart models a method body as a SIBLING of the signature, so the method
+    // node must be extended to span its body (not just the signature line) —
+    // required for body-level analysis (callees, the callback synthesizer).
+    expect(findById!.endLine).toBeGreaterThan(findById!.startLine);
   });
 
   it('should extract top-level function declarations', () => {
@@ -2011,6 +2241,27 @@ end
       expect(names).toContain('iostream');
       expect(names).toContain('vector');
       expect(names).toContain('config.h');
+    });
+
+    it('should create unresolved references for local includes', () => {
+      const code = `#include "myheader.h"`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'myheader.h'
+      );
+      expect(importRef).toBeDefined();
+      expect(importRef?.line).toBe(1);
+    });
+
+    it('should create unresolved references for system includes', () => {
+      const code = `#include <iostream>`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'iostream'
+      );
+      expect(importRef).toBeDefined();
     });
   });
 
@@ -2975,6 +3226,70 @@ export function multiply(a: number, b: number): number {
 
     cg.close();
   });
+
+  it('should count file-level tracked YAML files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'routes.yml'), 'route: value\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+    expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.yaml', 'routes.yml']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked YAML/Twig files as indexed in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'view.twig:twig']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked .properties files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+    fs.writeFileSync(path.join(tempDir, 'log.properties'), 'log.level=INFO\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    cg.close();
+  });
+
+  it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig', 'application.properties']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(3);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'application.properties:properties', 'view.twig:twig']);
+
+    cg.close();
+  });
 });
 
 describe('Path Normalization', () => {
@@ -3003,39 +3318,57 @@ describe('Directory Exclusion', () => {
     cleanupTempDir(tempDir);
   });
 
-  it('should exclude node_modules directories', () => {
-    // Create structure: src/index.ts + node_modules/pkg/index.js
+  it('should exclude directories listed in .gitignore', () => {
+    // Create structure: src/index.ts + node_modules/pkg/index.js, gitignore node_modules
     const srcDir = path.join(tempDir, 'src');
     const nmDir = path.join(tempDir, 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude nested node_modules directories', () => {
-    // Create structure: packages/app/node_modules/pkg/index.js
+  it('should exclude nested node_modules via a root .gitignore', () => {
+    // A trailing-slash pattern with no leading slash matches at any depth.
     const srcDir = path.join(tempDir, 'packages', 'app', 'src');
     const nmDir = path.join(tempDir, 'packages', 'app', 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('packages/app/src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude .git directories', () => {
+  it('should apply a nested .gitignore only to its own subtree', () => {
+    const appSrc = path.join(tempDir, 'app', 'src');
+    fs.mkdirSync(appSrc, { recursive: true });
+    fs.writeFileSync(path.join(appSrc, 'keep.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(appSrc, 'skip.ts'), 'export const b = 2;');
+    fs.writeFileSync(path.join(tempDir, 'app', '.gitignore'), 'src/skip.ts\n');
+    // A sibling with the same name outside app/ must NOT be ignored.
+    const otherDir = path.join(tempDir, 'other', 'src');
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(path.join(otherDir, 'skip.ts'), 'export const c = 3;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('app/src/keep.ts');
+    expect(files).not.toContain('app/src/skip.ts');
+    expect(files).toContain('other/src/skip.ts');
+  });
+
+  it('should always skip .git directories', () => {
     const srcDir = path.join(tempDir, 'src');
     const gitDir = path.join(tempDir, '.git', 'objects');
     fs.mkdirSync(srcDir, { recursive: true });
@@ -3043,8 +3376,7 @@ describe('Directory Exclusion', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(gitDir, 'pack.ts'), 'export const y = 2;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('.git'))).toBe(true);
@@ -3055,28 +3387,11 @@ describe('Directory Exclusion', () => {
     fs.mkdirSync(srcDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'Button.tsx'), 'export function Button() {}');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files.length).toBe(1);
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
-  });
-
-  it('should respect .codegraphignore marker', () => {
-    const srcDir = path.join(tempDir, 'src');
-    const vendorDir = path.join(tempDir, 'vendor');
-    fs.mkdirSync(srcDir, { recursive: true });
-    fs.mkdirSync(vendorDir, { recursive: true });
-    fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
-    fs.writeFileSync(path.join(vendorDir, 'lib.ts'), 'export const y = 2;');
-    fs.writeFileSync(path.join(vendorDir, '.codegraphignore'), '');
-
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
-
-    expect(files).toContain('src/index.ts');
-    expect(files.every((f) => !f.includes('vendor'))).toBe(true);
   });
 });
 
@@ -3124,11 +3439,81 @@ describe('Git Submodules', () => {
     );
     git(mainDir, 'commit', '-q', '-m', 'add submodule');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: mainDir };
-    const files = scanDirectory(mainDir, config);
+    const files = scanDirectory(mainDir);
 
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
+  });
+});
+
+describe('Nested non-submodule git repos', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('should index files in embedded git repos run from a git super-repo (issue #193)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    // Top-level workspace is itself a git repo, holding no source directly —
+    // the CMake "super-repo" layout from the issue.
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(path.join(root, 'coding'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.10)\n');
+
+    // Two independent clones living inside the workspace (NOT submodules):
+    // one with committed source, one with only untracked source.
+    const sub1 = path.join(root, 'sub_repo1', 'src');
+    fs.mkdirSync(sub1, { recursive: true });
+    git(path.join(root, 'sub_repo1'), 'init', '-q');
+    git(path.join(root, 'sub_repo1'), 'config', 'user.email', 'test@test.com');
+    git(path.join(root, 'sub_repo1'), 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(sub1, 'one.ts'), 'export const one = 1;');
+    git(path.join(root, 'sub_repo1'), 'add', '-A');
+    git(path.join(root, 'sub_repo1'), 'commit', '-q', '-m', 'sub1 init');
+
+    const sub2 = path.join(root, 'sub_repo2', 'src');
+    fs.mkdirSync(sub2, { recursive: true });
+    git(path.join(root, 'sub_repo2'), 'init', '-q');
+    fs.writeFileSync(path.join(sub2, 'two.ts'), 'export const two = 2;');
+
+    const files = scanDirectory(root);
+
+    // Both committed and untracked source from the nested repos must be found.
+    expect(files).toContain('sub_repo1/src/one.ts');
+    expect(files).toContain('sub_repo2/src/two.ts');
+  });
+
+  it('should respect each embedded repo\'s own .gitignore', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+
+    const sub = path.join(root, 'sub_repo', 'src');
+    fs.mkdirSync(sub, { recursive: true });
+    git(path.join(root, 'sub_repo'), 'init', '-q');
+    fs.writeFileSync(path.join(root, 'sub_repo', '.gitignore'), 'src/generated.ts\n');
+    fs.writeFileSync(path.join(sub, 'real.ts'), 'export const real = 1;');
+    fs.writeFileSync(path.join(sub, 'generated.ts'), 'export const generated = 1;');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('sub_repo/src/real.ts');
+    expect(files).not.toContain('sub_repo/src/generated.ts');
   });
 });
 
@@ -3486,6 +3871,53 @@ function increment(): void {
     }
   });
 
+  it('should extract calls from top-level <script setup> initializers', () => {
+    const code = `<template>
+  <div>{{ token }}</div>
+</template>
+
+<script setup lang="ts">
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+</script>
+`;
+    const result = extractFromSource('Issue425Setup.vue', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from Vue Options API object methods', () => {
+    const code = `<template>
+  <button @click="save">Save</button>
+</template>
+
+<script>
+import { getTokenMp } from './api/upload';
+
+export default {
+  methods: {
+    save() {
+      return getTokenMp();
+    }
+  },
+  setup() {
+    return getTokenMp();
+  }
+}
+</script>
+`;
+    const result = extractFromSource('Issue425Options.vue', code);
+
+    const calls = result.unresolvedReferences.filter(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(calls).toHaveLength(2);
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>
@@ -3647,5 +4079,311 @@ class Svc {
     // The decorated symbol must be `method`, not the constructor or class.
     const decoratedNode = result.nodes.find((n) => n.id === decorMethod!.fromNodeId);
     expect(decoratedNode?.name).toBe('method');
+  });
+});
+
+// =============================================================================
+// Lua
+// =============================================================================
+
+describe('Lua Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Lua files', () => {
+      expect(detectLanguage('init.lua')).toBe('lua');
+      expect(detectLanguage('src/util.lua')).toBe('lua');
+    });
+
+    it('should report Lua as supported', () => {
+      expect(isLanguageSupported('lua')).toBe(true);
+      expect(getSupportedLanguages()).toContain('lua');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract global and local functions', () => {
+      const code = `
+function configure(opts) return opts end
+local function helper(x) return x * 2 end
+`;
+      const result = extractFromSource('init.lua', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('configure');
+      expect(funcs).toContain('helper');
+      const configure = result.nodes.find((n) => n.name === 'configure');
+      expect(configure?.language).toBe('lua');
+      expect(configure?.signature).toBe('(opts)');
+    });
+
+    it('should split table/method functions into a receiver and method name', () => {
+      const code = `
+function M.connect(host, port) return host end
+function M:send(data) return self end
+`;
+      const result = extractFromSource('init.lua', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const connect = methods.find((m) => m.name === 'connect');
+      expect(connect?.qualifiedName).toBe('M::connect');
+      const send = methods.find((m) => m.name === 'send');
+      expect(send?.qualifiedName).toBe('M::send');
+    });
+  });
+
+  describe('Variable extraction', () => {
+    it('should extract local variable declarations', () => {
+      const code = `
+local M = {}
+local count = 0
+`;
+      const result = extractFromSource('mod.lua', code);
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('M');
+      expect(vars).toContain('count');
+    });
+  });
+
+  describe('Import extraction (require)', () => {
+    it('should extract require() in local declarations and bare calls', () => {
+      const code = `
+local socket = require("socket")
+local http = require "resty.http"
+require("side.effect")
+`;
+      const result = extractFromSource('net.lua', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('socket');
+      expect(imports).toContain('resty.http');
+      expect(imports).toContain('side.effect');
+
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'socket'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    // Regression: the tree-sitter-wasms Lua grammar (ABI 13) corrupts the shared
+    // WASM heap under web-tree-sitter 0.25, dropping nested calls/imports on every
+    // parse after the first. We vendor the ABI-15 grammar instead — this guards it
+    // by extracting several sources in sequence and asserting the LAST still works.
+    it('should keep extracting require across many sequential parses', () => {
+      let last;
+      for (let i = 0; i < 8; i++) {
+        last = extractFromSource(`f${i}.lua`, `local m = require("module.${i}")\nreturn m\n`);
+      }
+      const imports = last!.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('module.7');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record intra-file calls as resolvable references', () => {
+      const code = `
+local function helper(x) return x end
+local function run(y) return helper(y) end
+`;
+      const result = extractFromSource('calls.lua', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+});
+
+// =============================================================================
+// Luau (typed superset of Lua — https://luau.org)
+// =============================================================================
+
+describe('Luau Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Luau files', () => {
+      expect(detectLanguage('init.luau')).toBe('luau');
+      expect(detectLanguage('src/Client.luau')).toBe('luau');
+    });
+
+    it('should report Luau as supported', () => {
+      expect(isLanguageSupported('luau')).toBe(true);
+      expect(getSupportedLanguages()).toContain('luau');
+    });
+  });
+
+  describe('Type aliases', () => {
+    it('should extract `type` and `export type` definitions', () => {
+      const code = `
+export type Vector = { x: number, y: number }
+type Handler = (msg: string) -> boolean
+`;
+      const result = extractFromSource('types.luau', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias');
+      const vector = aliases.find((a) => a.name === 'Vector');
+      expect(vector).toBeDefined();
+      expect(vector?.isExported).toBe(true);
+      const handler = aliases.find((a) => a.name === 'Handler');
+      expect(handler).toBeDefined();
+      expect(handler?.isExported).toBe(false);
+    });
+  });
+
+  describe('Typed functions and methods', () => {
+    it('should capture typed signatures and split methods by receiver', () => {
+      const code = `
+function configure(opts: { debug: boolean }): boolean
+	return opts.debug
+end
+function Client:fetch(path: string): Response
+	return path
+end
+`;
+      const result = extractFromSource('client.luau', code);
+      const configure = result.nodes.find((n) => n.kind === 'function' && n.name === 'configure');
+      expect(configure?.language).toBe('luau');
+      expect(configure?.signature).toBe('(opts: { debug: boolean }): boolean');
+      const fetch = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetch');
+      expect(fetch?.qualifiedName).toBe('Client::fetch');
+    });
+  });
+
+  describe('Imports and variables', () => {
+    it('should extract string and Roblox instance-path require imports', () => {
+      const code = `
+local http = require("http")
+local Signal = require(script.Parent.Signal)
+local count = 0
+`;
+      const result = extractFromSource('mod.luau', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('http'); // string require
+      expect(imports).toContain('Signal'); // Roblox instance-path require
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('count');
+    });
+  });
+});
+
+// =============================================================================
+// Objective-C
+// =============================================================================
+
+describe('Objective-C Extraction', () => {
+  const sample = `
+#import <Foundation/Foundation.h>
+#import "MyClass.h"
+
+@interface MyClass : NSObject <NSCopying>
+@property (nonatomic, copy) NSString *name;
+- (void)greet;
+- (void)doThing:(id)x with:(id)y;
++ (instancetype)shared;
+@end
+
+@implementation MyClass
+
+- (void)greet {
+    NSLog(@"Hello");
+    [self doWork];
+}
+
+- (void)doThing:(id)x with:(id)y {
+    [self notify:x];
+}
+
++ (instancetype)shared {
+    return [[MyClass alloc] init];
+}
+
+@end
+
+void helperFunction(int count) {
+    MyClass *obj = [MyClass shared];
+    [obj greet];
+}
+`;
+
+  it('should extract classes, methods, functions, and imports', () => {
+    const result = extractFromSource('App.m', sample);
+
+    const classes = result.nodes.filter((n) => n.kind === 'class');
+    expect(classes.filter((c) => c.name === 'MyClass')).toHaveLength(1);
+
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.map((m) => m.name).sort()).toEqual(['doThing:with:', 'greet', 'shared']);
+
+    const shared = methods.find((m) => m.name === 'shared');
+    expect(shared?.isStatic).toBe(true);
+
+    const properties = result.nodes.filter((n) => n.kind === 'property');
+    expect(properties.some((p) => p.name === 'name')).toBe(true);
+
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    expect(functions.some((f) => f.name === 'helperFunction')).toBe(true);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('Foundation/Foundation.h');
+    expect(imports).toContain('MyClass.h');
+  });
+
+  it('should record inheritance and protocol conformance', () => {
+    const result = extractFromSource('App.m', sample);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('NSObject');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('NSCopying');
+  });
+
+  it('should record message sends and C calls', () => {
+    const result = extractFromSource('App.m', sample);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['NSLog', 'doWork', 'MyClass.shared', 'obj.greet']));
+  });
+
+  it('should reconstruct multi-keyword selectors at the call site so they resolve to the method definition', () => {
+    // Regression for the gap discovered post-#165: message_expression's
+    // multi-keyword form `[obj a:1 b:2]` was only emitting the first keyword,
+    // so calls never resolved to multi-part method definitions like
+    // `GET:parameters:headers:progress:success:failure:`. The call-site name
+    // must match the method-definition name with full keywords + trailing colons.
+    const code = `
+@implementation Caller
+- (void)demo {
+    NSMutableDictionary *d = [NSMutableDictionary new];
+    [d setObject:@"v" forKey:@"k"];
+    [d setObject:@"v2" forKey:@"k2" withRetry:@YES];
+    [self touchesBegan:nil withEvent:nil];
+}
+@end
+`;
+    const result = extractFromSource('Caller.m', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        'd.setObject:forKey:',
+        'd.setObject:forKey:withRetry:',
+        'touchesBegan:withEvent:',
+      ])
+    );
+  });
+
+  it('should not classify pure C headers with @end in comments as objc', () => {
+    const cHeader = '/* @end of file */\n#ifndef STDIO_H\nvoid printf(const char *);\n#endif\n';
+    expect(detectLanguage('stdio.h', cHeader)).toBe('c');
+  });
+
+  it('should extract protocol declarations', () => {
+    const code = `
+@protocol DataSource <NSObject>
+- (NSInteger)numberOfItems;
+@end
+`;
+    const result = extractFromSource('DataSource.h', code);
+    const protocol = result.nodes.find((n) => n.kind === 'protocol' && n.name === 'DataSource');
+    expect(protocol).toBeDefined();
+  });
+
+  it('should report Objective-C as supported', () => {
+    expect(isLanguageSupported('objc')).toBe(true);
+    expect(getSupportedLanguages()).toContain('objc');
   });
 });

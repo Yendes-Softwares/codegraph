@@ -7,7 +7,6 @@
 
 import * as path from 'path';
 import {
-  CodeGraphConfig,
   Node,
   Edge,
   FileRecord,
@@ -25,7 +24,6 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
-import { loadConfig, saveConfig, createDefaultConfig } from './config';
 import {
   isInitialized,
   createDirectory,
@@ -48,12 +46,11 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
-import { FileWatcher, WatchOptions } from './sync';
+import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 
 // Re-export types for consumers
 export * from './types';
 export { getDatabasePath } from './db';
-export { getConfigPath } from './config';
 export {
   getCodeGraphDir,
   isInitialized,
@@ -78,16 +75,13 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions } from './sync';
+export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
 
 /**
  * Options for initializing a new CodeGraph project
  */
 export interface InitOptions {
-  /** Custom configuration overrides */
-  config?: Partial<CodeGraphConfig>;
-
   /** Whether to run initial indexing after init */
   index?: boolean;
 
@@ -128,7 +122,6 @@ export interface IndexOptions {
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
-  private config: CodeGraphConfig;
   private projectRoot: string;
   private orchestrator: ExtractionOrchestrator;
   private resolver: ReferenceResolver;
@@ -148,17 +141,15 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    config: CodeGraphConfig,
     projectRoot: string
   ) {
     this.db = db;
     this.queries = queries;
-    this.config = config;
     this.projectRoot = projectRoot;
     this.fileLock = new FileLock(
       path.join(projectRoot, '.codegraph', 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, config, queries);
+    this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
     this.resolver = createResolver(projectRoot, queries);
     this.graphManager = new GraphQueryManager(queries);
     this.traverser = new GraphTraverser(queries);
@@ -194,19 +185,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Run initial indexing if requested
     if (options.index) {
@@ -219,7 +203,7 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string, options: Omit<InitOptions, 'index' | 'onProgress'> = {}): CodeGraph {
+  static initSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -230,19 +214,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -267,15 +244,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Sync if requested
     if (options.sync) {
@@ -302,15 +276,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -328,32 +299,6 @@ export class CodeGraph {
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
-  }
-
-  // ===========================================================================
-  // Configuration
-  // ===========================================================================
-
-  /**
-   * Get the current configuration
-   */
-  getConfig(): CodeGraphConfig {
-    return { ...this.config };
-  }
-
-  /**
-   * Update configuration
-   */
-  updateConfig(updates: Partial<CodeGraphConfig>): void {
-    Object.assign(this.config, updates);
-    saveConfig(this.projectRoot, this.config);
-    // Recreate orchestrator and resolver with new config
-    this.orchestrator = new ExtractionOrchestrator(
-      this.projectRoot,
-      this.config,
-      this.queries
-    );
-    this.resolver = createResolver(this.projectRoot, this.queries);
   }
 
   /**
@@ -380,7 +325,22 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
+        const before = this.queries.getNodeAndEdgeCount();
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+
+        // Re-detect frameworks now that the index is populated. The resolver
+        // is constructed with createResolver() before any files exist, so
+        // framework resolvers whose detect() consults the indexed file list
+        // (e.g. UIKit/SwiftUI scanning for imports, swift-objc-bridge looking
+        // for both Swift and ObjC files) all return false on that initial pass
+        // and silently drop themselves. Re-initializing here gives them a
+        // chance to see the actual project before resolution runs.
+        if (result.success && result.filesIndexed > 0) {
+          this.resolver.initialize();
+          // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
+          // before resolution so updated names show up in subsequent reads.
+          this.resolver.runPostExtract();
+        }
 
         // Resolve references to create call/import/extends edges
         if (result.success && result.filesIndexed > 0) {
@@ -400,6 +360,21 @@ export class CodeGraph {
               total,
             });
           });
+        }
+
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        // Cheap and non-blocking; never load-bearing for correctness.
+        if (result.success && result.filesIndexed > 0) {
+          this.db.runMaintenance();
+        }
+
+        // The orchestrator only sees extraction-phase counts; resolution and
+        // synthesizer edges (often >50% of the graph on JVM repos) come later.
+        // Recompute against the DB so the CLI summary reports the true totals.
+        if (result.success && result.filesIndexed > 0) {
+          const after = this.queries.getNodeAndEdgeCount();
+          result.nodesCreated = after.nodes - before.nodes;
+          result.edgesCreated = after.edges - before.edges;
         }
 
         return result;
@@ -444,6 +419,14 @@ export class CodeGraph {
       try {
         const result = await this.orchestrator.sync(options.onProgress);
 
+        // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
+        // every sync that touched files so edits to `app.module.ts` propagate
+        // to controllers in unchanged files. The pass is idempotent and cheap
+        // (regex over *.module.ts only).
+        if (result.filesAdded > 0 || result.filesModified > 0) {
+          this.resolver.runPostExtract();
+        }
+
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
           if (result.changedFilePaths) {
@@ -483,6 +466,11 @@ export class CodeGraph {
           }
         }
 
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+          this.db.runMaintenance();
+        }
+
         return result;
       } finally {
         this.fileLock.release();
@@ -515,9 +503,16 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      this.config,
       async () => {
         const result = await this.sync();
+        // sync() returns this exact zero-shape iff it failed to acquire the
+        // file lock (a real empty sync always has filesChecked > 0 because
+        // scanDirectory ran). Surface that to the watcher as a typed error
+        // so it keeps pendingFiles + reschedules instead of clearing them
+        // (#449).
+        if (result.filesChecked === 0 && result.durationMs === 0) {
+          throw new LockUnavailableError();
+        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
@@ -542,6 +537,31 @@ export class CodeGraph {
    */
   isWatching(): boolean {
     return this.watcher?.isActive() ?? false;
+  }
+
+  /**
+   * Files seen by the file watcher since the last successful sync —
+   * the per-file "stale" signal MCP tools attach to responses so an agent
+   * can fall back to {@link Read} for just the affected file without
+   * waiting for a debounced sync to complete (issue #403).
+   *
+   * Returns an empty list when the watcher isn't active, or no events have
+   * arrived. Each entry includes `firstSeenMs` and `lastSeenMs` (wall-clock
+   * `Date.now()` values) so callers can render "edited Nms ago", plus an
+   * `indexing` flag indicating whether the in-flight sync (if any) will
+   * absorb that file.
+   */
+  getPendingFiles(): PendingFile[] {
+    return this.watcher?.getPendingFiles() ?? [];
+  }
+
+  /**
+   * Resolves once the file watcher has finished its initial chokidar scan.
+   * Useful for tests that need a deterministic boundary before asserting on
+   * `getPendingFiles()`. Resolves immediately when no watcher is active.
+   */
+  waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
+    return this.watcher ? this.watcher.waitUntilReady(timeoutMs) : Promise.resolve();
   }
 
   /**
@@ -613,13 +633,22 @@ export class CodeGraph {
   }
 
   /**
-   * Active SQLite backend for this project's connection. `wasm` means
-   * the native better-sqlite3 install failed and the WASM fallback is
-   * serving requests at 5-10x the latency. Surfaced via `codegraph
-   * status` and the `codegraph_status` MCP tool.
+   * Active SQLite backend for this project's connection (`node-sqlite` — Node's
+   * built-in real-SQLite module). Surfaced via `codegraph status` and the
+   * `codegraph_status` MCP tool alongside the effective journal mode.
    */
   getBackend(): import('./db').SqliteBackend {
     return this.db.getBackend();
+  }
+
+  /**
+   * The journal mode actually in effect ('wal', 'delete', …). 'wal' means
+   * readers never block on a concurrent writer; anything else means they can,
+   * which is the precondition for the "database is locked" failures in issue
+   * #238. Surfaced via `codegraph status` and the `codegraph_status` MCP tool.
+   */
+  getJournalMode(): string {
+    return this.db.getJournalMode();
   }
 
   // ===========================================================================
@@ -652,6 +681,33 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Find the project's "primary route file" — the file with the densest
+   * concentration of framework-emitted `route` nodes (≥3 routes, ≥30%
+   * of all non-test routes). Used to inline the routing config in
+   * `codegraph_context` responses on small realworld template repos
+   * (rails-realworld, laravel-realworld, drupal-admintoolbar, …) where
+   * Glob+Read of `routes.rb`/`urls.py`/etc. otherwise beats codegraph.
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    return this.queries.getTopRouteFile();
+  }
+
+  /**
+   * Build a URL → handler routing manifest from the index. Each entry
+   * pairs a route node (URL + method) with its handler function/method
+   * via the `references` edge that framework resolvers emit. Returns
+   * null when fewer than 3 valid (non-test) routes exist.
+   */
+  getRoutingManifest(limit?: number): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    return this.queries.getRoutingManifest(limit);
   }
 
   // ===========================================================================
