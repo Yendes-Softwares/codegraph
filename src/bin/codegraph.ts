@@ -32,8 +32,10 @@ import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
+import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -89,6 +91,13 @@ if (nodeMajor < MIN_NODE_MAJOR) {
 // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
 relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
+// Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
+// that reaches here escaped every boundary, so the process is in an undefined
+// state — keeping it alive is what let the detached MCP daemon orphan and pin a
+// CPU core with no recovery (#799, #850). Installed before the command branch
+// so it also covers a synchronous throw during startup. See ./fatal-handler.
+installFatalHandlers();
+
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
   import('../installer').then(({ runInstaller }) =>
@@ -101,14 +110,6 @@ if (process.argv.length === 2) {
   // Normal CLI flow
   main();
 }
-
-process.on('uncaughtException', (error) => {
-  console.error('[CodeGraph] Uncaught exception:', error);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[CodeGraph] Unhandled rejection:', reason);
-});
 
 function main() {
 
@@ -152,6 +153,27 @@ program
   .name('codegraph')
   .description('Code intelligence and knowledge graph for any codebase')
   .version(packageJson.version);
+
+// Anonymous usage telemetry (see TELEMETRY.md): record the invoked subcommand
+// NAME only — never arguments or paths. Counts buffer locally; network sends
+// piggyback on commands that run long anyway (quick commands only append to
+// the local buffer at exit, costing nothing).
+// install/uninstall are absent on purpose: the installer flushes at its own
+// end, AFTER its consent prompt — a flush here would fire the first-run
+// notice before the user ever sees the toggle.
+const TELEMETRY_FLUSH_COMMANDS = new Set(['init', 'uninit', 'index', 'sync', 'upgrade']);
+program.hook('preAction', (_thisCommand, actionCommand) => {
+  try {
+    // The detached daemon re-invokes `serve --mcp` internally — not a user action.
+    if (process.env.CODEGRAPH_DAEMON_INTERNAL) return;
+    const name = actionCommand.name();
+    if (name === 'telemetry') return; // managing telemetry is not usage
+    getTelemetry().recordUsage('cli_command', name, true);
+    if (TELEMETRY_FLUSH_COMMANDS.has(name)) getTelemetry().maybeFlush();
+  } catch {
+    /* telemetry must never break the CLI */
+  }
+});
 
 // =============================================================================
 // Helper Functions
@@ -409,6 +431,19 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 }
 
+/**
+ * Telemetry for a completed full index (see TELEMETRY.md). The bounded flush
+ * keeps init/index responsive (these commands just ran for seconds anyway)
+ * while delivering the event promptly.
+ */
+async function recordIndexTelemetry(
+  cg: { getStats(): { filesByLanguage: Record<string, number> }; getBackend(): string },
+  result: IndexResult,
+): Promise<void> {
+  recordIndexEvent(cg, result);
+  await getTelemetry().flushNow();
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -461,6 +496,7 @@ program
         await progress.stop();
       }
       printIndexResult(clack, result, projectPath);
+      await recordIndexTelemetry(cg, result);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -523,6 +559,13 @@ program
       } catch { /* non-fatal */ }
 
       success(`Removed CodeGraph from ${projectPath}`);
+
+      // Churn signal — and flush now, since after an uninit there may be no
+      // "next run" to deliver it.
+      try {
+        getTelemetry().recordLifecycle('uninstall', {});
+        await getTelemetry().flushNow();
+      } catch { /* non-fatal */ }
     } catch (err) {
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -585,6 +628,7 @@ program
       }
 
       printIndexResult(clack, result, projectPath);
+      await recordIndexTelemetry(cg, result);
 
       if (!result.success) {
         process.exit(1);
@@ -915,7 +959,7 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath} — run 'codegraph init' first.`);
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
         process.exit(1);
       }
 
@@ -957,7 +1001,7 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath} — run 'codegraph init' first.`);
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
         process.exit(1);
       }
 
@@ -968,12 +1012,15 @@ program
 
       // A name with a path separator is a file read; otherwise a symbol
       // (use --file for basename-only file reads or to pin an overload).
+      // Both separators: Windows users type src\auth\session.ts. Symbols
+      // never contain either ('/' isn't an identifier char anywhere we
+      // index; C++ scope is '::', JS members '.').
       const args: Record<string, unknown> = {};
       if (options.file) {
         args.file = options.file;
         if (name && name !== options.file) args.symbol = name;
-      } else if (name.includes('/')) {
-        args.file = name;
+      } else if (name.includes('/') || name.includes('\\')) {
+        args.file = name.replace(/\\/g, '/');
       } else {
         args.symbol = name;
         args.includeCode = true;
@@ -1779,6 +1826,50 @@ program
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+  });
+
+/**
+ * codegraph telemetry [on|off|status]
+ */
+program
+  .command('telemetry [action]')
+  .description('Show or change anonymous usage telemetry (status, on, off)')
+  .action((action?: string) => {
+    const t = getTelemetry();
+
+    if (action === 'on' || action === 'off') {
+      t.setEnabled(action === 'on', 'cli');
+      if (action === 'on') {
+        success('Telemetry enabled — anonymous usage stats only (no code, paths, or names).');
+      } else {
+        success('Telemetry disabled. Buffered, unsent data was deleted.');
+      }
+      const effective = t.getStatus();
+      if (effective.decidedBy === 'DO_NOT_TRACK' || effective.decidedBy === 'CODEGRAPH_TELEMETRY') {
+        warn(
+          `The ${effective.decidedBy} environment variable overrides this choice — ` +
+          `effective state right now: ${effective.enabled ? 'enabled' : 'disabled'}.`
+        );
+      }
+      return;
+    }
+
+    if (action !== undefined && action !== 'status') {
+      error(`Unknown action: ${action} (expected status, on, or off)`);
+      process.exit(1);
+    }
+
+    const s = t.getStatus();
+    const decidedBy: Record<typeof s.decidedBy, string> = {
+      DO_NOT_TRACK: 'DO_NOT_TRACK environment variable',
+      CODEGRAPH_TELEMETRY: 'CODEGRAPH_TELEMETRY environment variable',
+      config: 'your saved choice',
+      default: 'default',
+    };
+    console.log(`\nTelemetry: ${s.enabled ? chalk.green('enabled') : chalk.yellow('disabled')} ${chalk.dim(`(${decidedBy[s.decidedBy]})`)}`);
+    console.log(`Machine ID: ${s.machineId ?? chalk.dim('(random UUID, created on first use)')}`);
+    console.log(`Config:     ${s.configPath}`);
+    console.log(chalk.dim(`\nExactly what is collected (and never collected): ${TELEMETRY_DOCS}\n`));
   });
 
 /**
